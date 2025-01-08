@@ -1,0 +1,1954 @@
+
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\.env
+
+DB_HOST = localhost
+DB_USER = postgres
+DB_PASSWORD = 1234
+DB_NAME = sita_test
+DB_PORT = 5432
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\requirements.txt
+
+fastapi
+langchain
+openai
+redis
+uvicorn
+pdfkit  # For PDF generation
+loguru  # For logging
+langchain-community
+psycopg2
+transformers
+accelerate
+chromadb
+sentence-transformers
+fpdf
+langchain-openai
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\rough.py
+
+from typing import List, Dict, Any
+from langchain_openai import ChatOpenAI
+import chromadb
+from sentence_transformers import SentenceTransformer
+import psycopg2
+from langchain_community.agent_toolkits.sql.base import create_sql_agent
+from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
+from langchain_community.utilities import SQLDatabase
+import warnings
+import json
+from sqlalchemy import create_engine
+import re
+import os
+from dotenv import load_dotenv
+from langchain.callbacks.tracers import ConsoleCallbackHandler
+import datetime
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Access the API key
+api_key = os.getenv('OPENAI_API_KEY')
+
+llm = ChatOpenAI(model='gpt-4o-mini', api_key=api_key, temperature=0.000000001)
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+# Initialize the embedding model
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+def generate_embeddings(text):
+    return model.encode(text).tolist()
+
+# Function to sanitize metadata values
+def sanitize_metadata(value):
+    return value if value is not None else 'N/A'
+
+# Initialize ChromaDB client
+client = chromadb.Client()
+
+# Dictionary to store collections
+schema_collections = {}
+
+def create_schema_collections(schema_names):
+    """Create separate collections for each schema"""
+    for schema in schema_names:
+        collection_name = f"{schema}_collection"
+        schema_collections[schema] = client.get_or_create_collection(name=collection_name)
+        print(f"Created/Retrieved collection for schema: {schema}")
+
+
+# # Function to store metadata and embeddings in ChromaDB (only if not already stored)
+def store_in_chromadb(schema_descriptions):
+    """Store table descriptions in respective schema collections"""
+    for schema, tables in schema_descriptions.items():
+        collection = schema_collections[schema]
+        
+        for table, details in tables.items():
+            table_id = f"{schema}_{table}"
+            table_description = sanitize_metadata(details.get('description', 'No description available'))
+            
+            # Convert column information to a string representation
+            columns_str = json.dumps([
+                f"{col}: {sanitize_metadata(data['data_type'])}"
+                for col, data in details['columns'].items()
+            ])
+            
+            # Create metadata with string values
+            metadata_dict = {
+                'schema': schema,
+                'table': table,
+                # 'columns_json': columns_str  # Store columns as a JSON string
+                'columns': columns_str  # Store columns as a JSON string
+
+            }
+            
+            # Store in ChromaDB
+            collection.upsert(
+                ids=[table_id],
+                documents=[f"{table_description}\nColumns: {columns_str}"],
+                embeddings=[generate_embeddings(table_description)],
+                metadatas=[metadata_dict]
+            )
+            print(f"Stored embeddings for {table_id} in {schema} collection")
+
+def select_schema_collection(user_query):
+    """Select the appropriate schema collection based on user query"""
+    # Simple logic to detect schema name in the query
+    # Can be made more sophisticated if needed
+    for schema in schema_collections:
+        if schema.lower() in user_query.lower():
+            return schema, schema_collections[schema]
+    return None, None
+
+relevant_tables = []
+
+def query_tables(user_query):
+    """Query relevant tables based on user input"""
+    schema_name, collection = select_schema_collection(user_query)
+    
+    if not collection:
+        return {"error": "No matching schema found in the query"}
+    
+    # Search in the selected schema collection
+    results = collection.query(
+        query_texts=[user_query],
+        n_results=5  # Adjust based on needs
+    )
+
+    if 'metadatas' in results and results['metadatas'] and results['metadatas'][0]:
+        for metadata in results['metadatas'][0]:
+            if 'table' in metadata and 'schema' in metadata:
+                # schema = metadata['schema']
+                relevant_tables.append(metadata['table'])
+
+    # Process and return results
+    table_info = []
+    for i, doc in enumerate(results['documents'][0]):
+        metadata = results['metadatas'][0][i]
+        table_info.append({
+            'table_name': metadata['table'],
+            'description': doc,
+            'columns': metadata['columns']
+        })
+    
+    return {
+        'schema': schema_name,
+        'matching_tables': table_info
+    }
+
+# Function to fetch metadata from PostgreSQL
+def get_postgresql_metadata(db_config):
+    conn = psycopg2.connect(**db_config)
+    cur = conn.cursor()
+    query = """
+    SELECT 
+        s.schema_name,
+        t.table_name,
+        pgd.description AS table_description,
+        c.column_name,
+        c.data_type
+    FROM 
+        information_schema.columns c
+    JOIN 
+        information_schema.tables t ON c.table_name = t.table_name AND c.table_schema = t.table_schema
+    JOIN 
+        information_schema.schemata s ON t.table_schema = s.schema_name
+    LEFT JOIN 
+        pg_description pgd ON pgd.objoid = (
+            SELECT oid 
+            FROM pg_class 
+            WHERE relname = t.table_name 
+            AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = s.schema_name)
+        ) AND pgd.objsubid = 0
+    WHERE 
+    s.schema_name IN ('exotel','rockman')
+    AND t.table_type = 'BASE TABLE'
+    ORDER BY 
+        s.schema_name, t.table_name, c.ordinal_position;
+    """
+    cur.execute(query)
+    rows = cur.fetchall()
+    metadata = {}
+    for schema, table, table_description, column, data_type in rows:
+        if schema not in metadata:
+            metadata[schema] = {}
+        if table not in metadata[schema]:
+            metadata[schema][table] = {
+                'description': table_description,
+                'columns': {}
+            }
+        metadata[schema][table]['columns'][column] = {'data_type': data_type}
+    cur.close()
+    conn.close()
+
+    return metadata
+
+def clean_sql_query(query):
+    if query:
+        # Remove markdown code block syntax and extra backticks
+        clean_query = re.sub(r'^`*\s*sql\s*`*|^`*|`*$', '', query)
+        clean_query = re.sub(r'^```sql\n|^```|\n```$', '', clean_query)
+        return clean_query.strip()
+    return query
+
+def update_sql_tool(agent):
+    for tool in agent.tools:
+        if tool.name == "sql_db_query":
+            original_run = tool._run  # Change from tool.run to tool._run
+            def cleaned_run(*args, **kwargs):
+                if args:
+                    args = list(args)
+                    args[0] = clean_sql_query(args[0])
+                if 'query' in kwargs:
+                    kwargs['query'] = clean_sql_query(kwargs['query'])
+                return original_run(*args, **kwargs)
+            tool._run = cleaned_run  # Change from tool.run to tool._run
+            break
+
+db_config = {
+        'host': 'localhost',
+        'user': 'postgres',
+        'password': '1234',
+        'dbname': 'sita_test',
+        'port': 5432
+    }
+
+def create_agent(question):
+
+    print("Question:", question)
+
+    descriptions = get_postgresql_metadata(db_config)
+
+    # Create collections for each schema
+    create_schema_collections(descriptions.keys())
+
+    # Store metadata in respective collections
+    store_in_chromadb(descriptions)
+
+    relevant_schema_info = query_tables(question)
+
+    engine = create_engine(f"postgresql+psycopg2://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['dbname']}?options=-csearch_path=exotel,rockman")
+
+    db = SQLDatabase(engine)
+
+    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+        
+    relevant_schema_text = "\n".join(relevant_tables)
+    
+    if 'schema' in relevant_schema_info:
+        schema = relevant_schema_info['schema']  
+
+    custom_prefix = """You are an AI assistant specialized in generating SQL queries for a {dialect} database. Your task is to help users by converting their natural language questions into accurate postgres SQL queries and executing them to provide answers. You should always return the top {top_k} results.
+
+    Important notes:
+
+    1. If a user specifies a schema name, focus on tables within that schema.
+    2. Always use the schema name when referring to tables (e.g., exotel.users_user instead of just users_user).
+    3. Before generating a query, use the RelevantTables tool to identify the most appropriate tables for the question.
+    4. If user ask to generate output in tabular form, create a table of the response with respect to the column names with each item in a new line.
+    5. If user ask question related to "alerts" or "alert", look into the {schema}.sita_sita_fact table and generate a correct query.
+    6. If user ask question related to "assets" or "asset", look into the {schema}.sita_factassets table and generate a correct query.
+    7. If user ask question for top results with high risk, prepare a list in Descending order.
+    8. If user ask question for top results with low risk, prepare a list in Ascending order.
+    9. If user ask question related to "rosi" or "risk of security investement", look into the {schema}.vmf_asset_metrics table and generate a correct query.
+    10. only use the following tables: {table_info}
+    11. You are tasked with calculating the "Mean Time to Detection" (MTTD) for a given set of records.
+
+    12. If user asks question related to Alert Resolution Rate (ARR) or Incident Resolution Rate (IRR) use only {schema}.sita_sita_fact table.
+        Alert resolution rate is calculate using the status_name column. use SQL LIKE operator for getting Closed. for example "LIKE %Closed%"
+        Alert resolution rate (ARR) = (Status as closed alerts/ Total alerts) *100.
+
+    13. If user askes question related to False Positive or Falso Positive use only {schema}.sita_sita_fact table.
+        False Positive is calculated using type_name column.
+        False Positive  = (Alerts as False Positve/total alerts)*100
+
+    Now, let's proceed with your question.
+
+    """
+    system_message = custom_prefix.format(dialect = "PostgreSQL", top_k=2, table_info = relevant_schema_text, schema= schema )
+
+    # Define agent executor kwargs
+    agent_executor_kwargs = {
+        "handle_parsing_errors": True,
+        "return_intermediate_steps": False
+    }
+
+    # Create the agent with the tools
+    agent = create_sql_agent(llm,toolkit, prefix=system_message,agent_type= 'openai-tools',agent_executor_kwargs=agent_executor_kwargs,verbose=True)
+
+    update_sql_tool(agent)  # Add this line to update the SQL tool
+
+    return agent
+
+class SQLQueryCallback(ConsoleCallbackHandler):
+    def __init__(self):
+        super().__init__()
+        self.queries = []
+        self.current_query = None
+        self.results = []
+        self.run_map = {} # add this to resolve run_map errors
+        self._schema_format = None # add this to resolve schema_format errors
+
+    def on_tool_start(self, serialized: Dict[str, Any], input_str: str, **kwargs) -> None:
+        if serialized["name"] == "sql_db_query":
+            try:
+                query_dict = json.loads(input_str)
+                self.current_query = query_dict["query"]
+            except:
+                self.current_query = input_str
+
+    def on_tool_end(self, output: str, **kwargs) -> None:
+        if self.current_query:
+            self.queries.append({
+                "query": self.current_query,
+                "result": output
+            })
+            self.current_query = None
+
+    def on_tool_error(self, error: str, **kwargs) -> None:
+        if self.current_query:
+            self.queries.append({
+                "query": self.current_query,
+                "error": error
+            })
+            self.current_query = None
+
+def extract_columns_from_query(sql_query):
+    """
+    Extract column names from a SQL SELECT query with improved robustness.
+    
+    Args:
+        sql_query (str): The SQL query to extract columns from
+    
+    Returns:
+        List[str]: List of extracted column names
+    """
+    # Normalize the query to make parsing easier
+    cleaned_query = sql_query.replace("'", "").replace("{", "").replace("}", "").replace("query: ", "").strip()
+
+    # Try to find the SELECT clause more flexibly
+    select_clause_match = re.search(r"SELECT\s+(.*?)\s+FROM", cleaned_query, re.IGNORECASE | re.DOTALL)
+    
+    if not select_clause_match:
+        # Alternative approach if standard match fails
+        select_clause_match = re.search(r"SELECT\s+(.*?)(?:\s+FROM|\s*$)", cleaned_query, re.IGNORECASE | re.DOTALL)
+    
+    if not select_clause_match:
+        print("No SELECT clause found")
+        return []
+
+    select_clause = select_clause_match.group(1).strip()
+
+    # Split columns carefully, handling aggregate and aliased columns
+    columns = []
+    current_column = []
+    paren_depth = 0
+    
+    for char in (select_clause + ','):
+        if char == '(':
+            paren_depth += 1
+        elif char == ')':
+            paren_depth -= 1
+        
+        if char == ',' and paren_depth == 0:
+            columns.append(''.join(current_column).strip())
+            current_column = []
+        else:
+            current_column.append(char)
+    
+    # Extract column names
+    extracted_columns = []
+    for column in columns:
+        # Check for AS alias first
+        alias_match = re.search(r'\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)\b', column, re.IGNORECASE)
+        if alias_match:
+            extracted_columns.append(alias_match.group(1))
+            continue
+        
+        # Try to extract column name
+        column_match = re.search(r'(?:^|\W)([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', column)
+        if column_match:
+            extracted_columns.append(column_match.group(1))
+    
+    return extracted_columns
+
+def convert_sql_result_to_json(query: str, result: str) -> List[Dict[str, Any]]:
+    """
+    Convert SQL query result tuples to JSON format with column names.
+    
+    Args:
+        query (str): The SQL query that was executed
+        result (str): The string representation of the query result in tuple format
+        
+    Returns:
+        List[Dict[str, Any]]: List of dictionaries where each dictionary represents a row
+    """
+    # Extract column names from the query
+    columns = extract_columns_from_query(query)
+    
+    
+
+    # If no columns found, use generic column names
+    if not columns or len(columns) == 0:
+        # Count the number of values in first tuple to determine number of columns
+        first_tuple = result.split('),')[0] if '),' in result else result
+        value_count = first_tuple.count(',') + 1
+        columns = [f"column_{i}" for i in range(value_count)]
+    
+    # Convert string result to list of tuples
+    # Remove the outer brackets
+    clean_result = result.strip('[]')
+    # Split into individual tuples
+    tuple_strings = re.findall(r'\(([^)]+)\)', clean_result)
+    
+    json_results = []
+    for tuple_str in tuple_strings:
+        # Split the tuple string into values and clean them
+        values = [val.strip().strip("'") for val in tuple_str.split(',')]
+        
+        # Create a dictionary for this row
+        row_dict = {}
+        for i, value in enumerate(values):
+            if i < len(columns):
+                # Try to convert to appropriate type
+                try:
+                    if value.lower() == 'null':
+                        parsed_value = None
+                    elif value.replace('.', '').isdigit():  # Handle decimal numbers
+                        parsed_value = float(value) if '.' in value else int(value)
+                    else:
+                        parsed_value = value
+                except ValueError:
+                    parsed_value = value
+                
+                row_dict[columns[i]] = parsed_value
+        
+        json_results.append(row_dict)
+    
+    return json_results
+
+def agent_process_query(agent, question):
+    # Create callback handler
+    callback = SQLQueryCallback()
+    
+    # Execute agent with callback
+    response = agent.invoke(
+        {"input": question},
+        {"callbacks": [callback]}
+    )
+    
+    # Get the last successful query
+    successful_queries = [q for q in callback.queries if "error" not in q]
+    last_successful_query = successful_queries[-1] if successful_queries else None
+    # Generate column and values dictionary using LLM
+    prompt = f"""Extract and return the column names from 
+                User Query: {question}
+                SQL Query: {last_successful_query['query']}
+                and corresponding values from
+                SQL Result: {last_successful_query['result']}.
+                IMPORTANT: Ensure the output is valid and parseable JSON. Include all values, handle duplicates appropriately, 
+                and strictly follow the chart template provided."""
+    chart_response_data = llm.invoke(prompt)
+    chart_response_str = chart_response_data.content.strip()
+    # Remove code block markers if present
+    chart_response_str = chart_response_str.strip('```json\n').strip('```')
+
+    # chart_response = chart_response.strip('```python\n'.strip('```'))
+    chart_response = json.loads(chart_response_str)
+
+    if last_successful_query:
+        print(last_successful_query["result"])
+
+        #parse the chart_response into the desired structure
+        response_structure = []
+
+        # Add the Natural Language response as markdown
+        response_structure.append({
+            "type": "markdown",
+            "content": response["output"]
+        })
+
+            # Example logic to create a line chart
+        response_structure.append(chart_response)
+
+        # Serialize the entire answer to a json string
+
+        serialized_answer = json.dumps(response_structure)
+
+        return serialized_answer
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\test.py
+
+# # # # import re
+# # # # from typing import List, Dict, Any
+# # # # # # query = "SELECT id, status_name, (resolved_time - created_time) AS mttr\nFROM exotel.sita_sita_fact\nWHERE created_time >= 2024-01-01 AND created_time < 2024-02-01\nAND resolved_time IS NOT NULL\nORDER BY mttr DESC\nLIMIT 2;"
+
+# # # # # # # Regex to extract the SELECT clause
+# # # # # # select_clause = re.search(r"(?<=SELECT\s)(.*?)(?=\sFROM)", query, re.DOTALL).group(0)
+
+# # # # # # # Split by commas and process the columns
+# # # # # # columns = [col.split('AS')[-1].strip() if 'AS' in col else col.strip() for col in select_clause.split(',')]
+
+# # # # # # # Final list of column names
+# # # # # # print(select_clause)
+# # # # # # print(columns)
+
+
+# # # # # def extract_columns(cleaned_query):
+# # # # #     try:
+# # # # #         # First get everything between SELECT and FROM
+# # # # #         select_pattern = r"SELECT\s+(.*?)\s+FROM"
+# # # # #         select_match = re.search(select_pattern, cleaned_query, re.IGNORECASE | re.DOTALL)
+        
+# # # # #         if select_match:
+# # # # #             columns_str = select_match.group(1).strip()
+            
+# # # # #             # Look for AS followed by a column alias
+# # # # #             as_pattern = r"\bAS\s+(\w+)"
+# # # # #             as_match = re.search(as_pattern, columns_str, re.IGNORECASE)
+            
+# # # # #             if as_match:
+# # # # #                 # Return the alias name after AS
+# # # # #                 return as_match.group(1)
+# # # # #             else:
+# # # # #                 # If no AS found, you might want to handle the original column names here
+# # # # #                 return None
+                
+# # # # #         return None
+# # # # #     except Exception as e:
+# # # # #         print(f"Error extracting columns: {e}")
+# # # # #         return None
+
+# # # # # # Test it
+# # # # # cleaned_query = "SELECT AVG(resolved_time - created_time) AS mttr\nFROM exotel.sita_sita_fact\nWHERE resolved_time IS NOT NULL AND created_time IS NOT NULL;"
+# # # # # column = extract_columns(cleaned_query)
+# # # # # print(f"Extracted column name: {column}")  # Will print: Extracted column name: mttr
+
+
+
+# # # # def extract_columns_from_query(query: str) -> List[str]:
+# # # #     """
+# # # #     Extract column names from a SQL SELECT query.
+# # # #     Handles both aliased columns (using AS) and direct column names.
+# # # #     """
+# # # #     # Clean the query
+# # # #     cleaned_query = query.replace("'", "").replace("{", "").replace("}", "").replace("query: ", "").strip()
+# # # #     print("cleaned_query:", cleaned_query)
+# # # #     print("type_query:", type(cleaned_query))
+
+# # # #     # Extract everything between SELECT and FROM
+# # # #     match = re.search(r"SELECT\s+(.*?)\s+FROM", cleaned_query, re.IGNORECASE | re.DOTALL | re.MULTILINE)
+# # # #     if not match:
+# # # #         return []
+    
+# # # #     columns_str = match.group(1).strip()
+# # # #     columns = []
+# # # #     current_column = ""
+# # # #     parentheses_count = 0
+# # # #     in_quotes = False
+# # # #     quote_char = None
+    
+# # # #     # Parse columns handling nested functions and quotes
+# # # #     for char in columns_str:
+# # # #         # Handle quotes (both single and double)
+# # # #         if char in ["'", '"'] and not in_quotes:
+# # # #             in_quotes = True
+# # # #             quote_char = char
+# # # #         elif char == quote_char and in_quotes:
+# # # #             in_quotes = False
+# # # #             quote_char = None
+            
+# # # #         # Handle parentheses
+# # # #         if char == '(' and not in_quotes:
+# # # #             parentheses_count += 1
+# # # #         elif char == ')' and not in_quotes:
+# # # #             parentheses_count -= 1
+# # # #         # Split columns only when not inside parentheses or quotes
+# # # #         elif char == ',' and parentheses_count == 0 and not in_quotes:
+# # # #             columns.append(current_column.strip())
+# # # #             current_column = ""
+# # # #             continue
+            
+# # # #         current_column += char
+    
+# # # #     if current_column:
+# # # #         columns.append(current_column.strip())
+    
+# # # #     # Process each column to handle aliases and direct column names
+# # # #     processed_columns = []
+# # # #     for col in columns:
+# # # #         col = col.strip()
+        
+# # # #         # Check for AS keyword (case insensitive)
+# # # #         as_match = re.search(r"\s+AS\s+(\w+)(?:\s*,?\s*$)", col, re.IGNORECASE)
+# # # #         if as_match:
+# # # #             # Extract alias after AS
+# # # #             alias = as_match.group(1).strip()
+# # # #             processed_columns.append(alias)
+# # # #         else:
+# # # #             # Handle direct column names
+# # # #             # Remove any function calls
+# # # #             col = re.sub(r'\w+\([^)]*\)', '', col)
+# # # #             # Handle star notation
+# # # #             if '*' in col:
+# # # #                 processed_columns.append('*')
+# # # #                 continue
+# # # #             # Remove table qualifiers and get base column name
+# # # #             col_parts = col.split('.')
+# # # #             base_col = col_parts[-1].strip()
+# # # #             # Remove any remaining parentheses and quotes
+# # # #             base_col = re.sub(r'[()"\']', '', base_col).strip()
+# # # #             if base_col and base_col != '*':
+# # # #                 processed_columns.append(base_col)
+    
+# # # #     return [col for col in processed_columns if col]  # Remove any empty strings
+
+# # # # # Test cases
+# # # # test_queries = [
+# # # #     # Test case 1: Simple columns
+# # # #     "SELECT column1, column2 FROM table",
+    
+# # # #     # Test case 2: Aliased columns
+# # # #     "SELECT AVG(resolved_time - created_time) AS mttr\nFROM table",
+    
+# # # #     # Test case 3: Mixed columns
+# # # #     """SELECT 
+# # # #         column1,
+# # # #         COUNT(*) AS total_count,
+# # # #         table.column2 AS alias2,
+# # # #         MAX(value) 
+# # # #     FROM table""",
+    
+# # # #     # Test case 4: Complex functions
+# # # #     "SELECT CONCAT(first_name, ' ', last_name) AS full_name, age FROM users",
+    
+# # # #     # Test case 5: Table qualified columns
+# # # #     "SELECT t1.column1, t2.column2 AS alias FROM table1 t1 JOIN table2 t2",
+# # # # ]
+
+# # # # # Test the function
+# # # # for query in test_queries:
+# # # #     print("\nQuery:", query)
+# # # #     print("Extracted columns:", extract_columns_from_query(query))
+
+
+# # # ############################ workin with AS only
+
+# # # import re
+
+# # # def extract_column_names(sql_query):
+# # #     # Normalize the query to make parsing easier
+# # #     sql_query = sql_query.strip()
+
+# # #     # Extract the SELECT clause
+# # #     select_clause_match = re.search(r"SELECT\s+(.*?)\s+FROM", sql_query, re.IGNORECASE)
+# # #     print("select_clause_match: ", select_clause_match)
+# # #     if not select_clause_match:
+# # #         return []
+
+# # #     select_clause = select_clause_match.group(1)
+# # #     print("select_clause: ", select_clause)
+
+# # #     # Find column aliases using AS or direct column references
+# # #     column_pattern = re.compile(r"\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)", re.IGNORECASE)
+# # #     columns = column_pattern.findall(select_clause)
+# # #     print("columns: ", columns)
+
+# # #     # Clean up any empty or null matches
+# # #     return [col for col in columns if col]
+
+# # # # Example Usage
+# # # sql_query = """SELECT alert_type, AVG(resolved_time - created_time) AS MTTR\nFROM exotel.sita_sita_fact\nWHERE created_time >= NOW() - INTERVAL '20 days'\nGROUP BY alert_type\nORDER BY MTTR DESC\nLIMIT 2;"""
+
+# # # columns = extract_column_names(sql_query)
+# # # print("Extracted column names:", columns)
+
+
+# # ################################# working with extracting column as well as Alias
+
+# # import re
+
+# # def extract_column_names(sql_query):
+# #     # Normalize the query to make parsing easier
+# #     sql_query = sql_query.strip()
+
+# #     # Extract the SELECT clause
+# #     select_clause_match = re.search(r"SELECT\s+(.*?)\s+FROM", sql_query, re.IGNORECASE | re.DOTALL)
+# #     print("select_clause_match: ", select_clause_match)
+# #     if not select_clause_match:
+# #         return []
+
+# #     select_clause = select_clause_match.group(1).strip()
+# #     print("select_clause: ", select_clause)
+
+# #     # Split by commas to handle multiple columns
+# #     columns = select_clause.split(",")
+# #     print("columns: ", columns)
+
+# #     extracted_columns = []
+# #     for column in columns:
+# #         column = column.strip()
+
+# #         # Check for aliases using AS
+# #         alias_match = re.search(r"\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)", column, re.IGNORECASE)
+# #         if alias_match:
+# #             extracted_columns.append(alias_match.group(1))
+# #         else:
+# #             # Handle direct column names without aliases
+# #             # Strip functions and keep only the main column reference
+# #             direct_column_match = re.match(r"([a-zA-Z_][a-zA-Z0-9_.]*)", column)
+# #             if direct_column_match:
+# #                 extracted_columns.append(direct_column_match.group(1))
+
+# #     return extracted_columns
+
+# # # Example Usage
+# # sql_query = """SELECT AVG(resolved_time - created_time) AS mttr\nFROM exotel.sita_sita_fact\nWHERE created_time >= 2024-08-01 AND created_time < 2024-09-01 AND resolved_time IS NOT NULL AND created_time IS NOT NULL;"""
+
+# # columns = extract_column_names(sql_query)
+# # print("Extracted column names:", columns)
+
+
+
+
+# ######################## string to numeric
+
+import pandas as pd
+import re
+
+def convert_duration_to_numeric(data):
+    """
+    Dynamically convert duration strings to numeric values using pandas.
+
+    Args:
+        data (dict): Input data dictionary
+
+    Returns:
+        dict: Updated data dictionary with numeric time values
+    """
+    def parse_duration_string(value):
+        """
+        Parse duration string into total minutes.
+
+        Args:
+            value (str): Duration string
+
+        Returns:
+            float or None: Total duration in minutes
+        """
+        if not isinstance(value, str):
+            return None
+
+        # Regular expression to match duration patterns
+        pattern = r'(\d+)\s*days?,?\s*(\d+)\s*hours?,?\s*(\d+)\s*minutes?'
+        match = re.match(pattern, value, re.IGNORECASE)
+
+        if match:
+            days = int(match.group(1))
+            hours = int(match.group(2))
+            minutes = int(match.group(3))
+
+            # Convert to total minutes
+            total_minutes = days * 24 * 60 + hours * 60 + minutes
+            return total_minutes
+
+        return None
+
+    def convert_nested_dict(obj):
+        """
+        Recursively search and convert duration strings in nested dictionaries and lists.
+
+        Args:
+            obj (dict/list/any): Input object to search for duration strings
+
+        Returns:
+            dict/list/any: Converted object
+        """
+        if isinstance(obj, dict):
+            # Create a copy to avoid modifying original dict during iteration
+            new_dict = obj.copy()
+            for key, value in obj.items():
+                # If value is a list, convert list items
+                if isinstance(value, list):
+                    new_dict[key] = [convert_nested_dict(item) for item in value]
+
+                # If value is a string, try to convert
+                elif isinstance(value, str):
+                    numeric_value = parse_duration_string(value)
+                    if numeric_value is not None:
+                        # Add a new key for numeric value if conversion successful
+                        new_dict[f'{key}_numeric'] = numeric_value
+
+                # Recursively handle nested dictionaries
+                elif isinstance(value, dict):
+                    new_dict[key] = convert_nested_dict(value)
+
+            return new_dict
+
+        elif isinstance(obj, list):
+            # Convert each item in the list
+            return [convert_nested_dict(item) for item in obj]
+
+        return obj
+
+    # Create a deep copy and convert
+    converted_data = convert_nested_dict(data)
+
+    return converted_data
+
+
+# Example usage
+example_response = {'columns': {'id': [2545, 2587, 2464, 2475, 2269], 
+                    'status_name': ['Assigned to Etek', 'Assigned to Etek', 'Closed by client', 'Closed by client', 'Closed by client'], 
+                    'mttr': [None, None, '7 days, 4 hours, 36 minutes', '5 days, 1 hour, 51 minutes', '5 days, 1 hour, 35 minutes']}, 
+                    'charts': [{'type': 'bar', 'data': {'xAxis': [2545, 2587, 2464, 2475, 2269], 
+                    'yAxis': [None, None, '7 days, 4 hours, 36 minutes', '5 days, 1 hour, 51 minutes', '5 days, 1 hour, 35 minutes'], 
+                    'legend': ['Assigned to Etek', 'Assigned to Etek', 'Closed by client', 'Closed by client', 'Closed by client']}}]}
+
+# Convert the response
+converted_response = convert_duration_to_numeric(example_response)
+print(converted_response)
+
+
+
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\claude_solution\app\config.py
+
+#config.py
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 2
+    MODEL_NAME: str = "all-MiniLM-L6-v2"
+
+    class config:
+        env_file = ".env"
+
+settings = Settings()
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\claude_solution\app\main.py
+
+#main.py
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import Response
+from typing import List
+from .models.schemas import (
+    Query, SessionResponse, ChatHistory, ExportFormat, QueryResponse, SessionRequest
+)
+from .services.redis_service import RedisService
+from .services.export_service import ExportService
+from .services.session_service import SessionService
+from .services.query_service import QueryService
+from .utils.logger import setup_logger
+from fastapi.middleware.cors import CORSMiddleware
+
+logger = setup_logger(__name__)
+
+app = FastAPI(title="NL to SQL Query API")
+
+# Define the allowed origins
+origins = [
+    "http://localhost:5173",  # Your frontend (React/Vite or similar)
+    "https://c374-2409-40c2-403d-33c3-3905-5617-3cdf-776.ngrok-free.app",  # Your backend exposed via ngrok
+]
+
+# Add CORS middleware to the application
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins= origins,  # List of allowed origins
+    allow_credentials=True,  # Allow cookies and credentials
+    allow_methods=["*"],  # Allow all HTTP methods
+    allow_headers=["*"],  # Allow all headers
+)
+
+# Dependencies
+def get_redis_service():
+    return RedisService()
+
+def get_session_service():
+    return SessionService()
+
+def get_query_service(redis_service: RedisService = Depends(get_redis_service),
+                    session_service: SessionService = Depends(get_session_service)):
+    return QueryService(redis_service, session_service)
+
+@app.post("/query", response_model=QueryResponse)
+async def process_query(
+    query: Query,
+    query_service: QueryService = Depends(get_query_service)
+):
+    """
+    Process a natural language query and return results.
+    A new session ID will be automatically generated if not provided.
+    """
+    # try:
+    return await query_service.process_query(
+        query.query,
+        query.similarity_threshold,
+        query.session_id
+        )
+    # except Exception as e:
+    #     logger.error(f"Error processing query: {str(e)}")
+    #     raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/get_all_sessions", response_model=List[SessionResponse])
+async def get_sessions(redis_service: RedisService = Depends(get_redis_service)):
+    try:
+        return redis_service.get_all_sessions()
+    except Exception as e:
+        logger.error(f"Error getting sessions: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/session_history", response_model=ChatHistory)
+async def get_session_history(
+    request: SessionRequest,
+    redis_service: RedisService = Depends(get_redis_service)):
+    try:
+        messages = redis_service.get_session_history(request.session_id)
+        return ChatHistory(messages=messages)
+    except Exception as e:
+        logger.error(f"Error getting session history: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/export_chat")
+async def export_chat(
+    export_request: ExportFormat,
+    redis_service: RedisService = Depends(get_redis_service)
+):
+    try:
+        messages = redis_service.get_session_history(export_request.session_id)
+        
+        if export_request.format.lower() == 'pdf':
+            content = ExportService.create_pdf_export(messages, export_request.session_id)
+            media_type = "application/pdf"
+            filename = f"chat_history_{export_request.session_id}.pdf"
+        elif export_request.format.lower() == 'text':
+            content = ExportService.create_text_export(messages, export_request.session_id)
+            media_type = "text/plain"
+            filename = f"chat_history_{export_request.session_id}.txt"
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported export format")
+        
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        logger.error(f"Error exporting chat: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.on_event("startup")
+async def startup_event():
+    try:
+        redis_service = RedisService()
+        redis_service.client.ping()
+        logger.info("Successfully connected to Redis")
+    except Exception as e:
+        logger.error(f"Startup error: {str(e)}")
+        raise
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    try:
+        redis_service = RedisService()
+        redis_service.client.close()
+        logger.info("Closed Redis connection")
+    except Exception as e:
+        logger.error(f"Shutdown error: {str(e)}")
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\claude_solution\app\models\schemas.py
+
+#schemas.py
+from pydantic import BaseModel
+from typing import Optional, List, Dict
+
+class Query(BaseModel):
+    query: str
+    session_id : Optional[str] = None
+    similarity_threshold: float = 0.97
+
+class SessionResponse(BaseModel):
+    session_id: str
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatHistory(BaseModel):
+    messages: List[ChatMessage]
+
+class ExportFormat(BaseModel):
+    format: str
+    session_id: str
+
+class QueryResponse(BaseModel):
+    session_id: str
+    query: str
+    response: str
+    cached: bool
+
+class SessionRequest(BaseModel):
+    session_id :str
+
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\claude_solution\app\models\__init__.py
+
+
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\claude_solution\app\services\export_service.py
+
+from fpdf import FPDF
+from typing import List, Dict
+from ..utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
+class ExportService:
+    @staticmethod
+    def create_pdf_export(messages: List[Dict], session_id: str) -> bytes:
+        try:
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Arial", size=14)
+
+            # Main title
+            pdf.cell(0, 10, txt="SITA - AI Reporting", ln=True, align="C")
+            pdf.ln(2)
+            # Session name line
+            pdf.set_font("Arial", "B", 10)
+            pdf.cell(0, 10, txt=f"Session Name: {session_id}", ln=True, align="C")
+            pdf.ln(5)
+            pdf.image("C:/Shreyansh/Samta/fastAPI_AI_reporting/samta_logo.jpg", x=185, y=10, w=20, h=10)
+            for msg in messages:
+                pdf.set_font("Arial", "B", 12)
+                pdf.cell(180, 10, txt=f"{msg['role'].capitalize()}:", ln=True)
+                pdf.set_font("Arial", size=12)
+                pdf.multi_cell(180, 5, txt=msg['content'])
+                pdf.ln(5)
+            
+            return pdf.output(dest='S').encode('latin1')
+        except Exception as e:
+            logger.error(f"Error creating PDF export: {str(e)}")
+            raise
+
+    @staticmethod
+    def create_text_export(messages: List[Dict], session_id: str) -> str:
+        try:
+            heading = "SITA - AI Reporting\n\n"
+            subheading = f"Session Name : {session_id}\n\n"
+            chat_history = "\n".join(
+                [f"{msg['role'].capitalize()}: {msg['content']}" for msg in messages]
+            )
+            return heading + subheading + chat_history
+        except Exception as e:
+            logger.error(f"Error creating text export: {str(e)}")
+            raise
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\claude_solution\app\services\query_processor.py
+
+#query_processor.py
+from typing import List, Dict, Any
+from langchain_openai import ChatOpenAI
+import chromadb
+from sentence_transformers import SentenceTransformer
+import psycopg2
+from langchain_community.agent_toolkits.sql.base import create_sql_agent
+from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
+from langchain_community.utilities import SQLDatabase
+import warnings
+import json
+from sqlalchemy import create_engine
+import re
+import os
+from dotenv import load_dotenv
+from langchain.callbacks.tracers import ConsoleCallbackHandler
+import datetime
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Access the API key
+api_key = os.getenv('OPENAI_API_KEY')
+
+llm = ChatOpenAI(model='gpt-4o-mini', api_key=api_key, temperature=0.000000001)
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Initialize the embedding model
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+def generate_embeddings(text):
+    return model.encode(text).tolist()
+
+# Function to sanitize metadata values
+def sanitize_metadata(value):
+    return value if value is not None else 'N/A'
+
+# Initialize ChromaDB client
+client = chromadb.Client()
+
+# Dictionary to store collections
+schema_collections = {}
+
+def create_schema_collections(schema_names):
+    """Create separate collections for each schema"""
+    for schema in schema_names:
+        collection_name = f"{schema}_collection"
+        schema_collections[schema] = client.get_or_create_collection(name=collection_name)
+        print(f"Created/Retrieved collection for schema: {schema}")
+
+# # Function to store metadata and embeddings in ChromaDB (only if not already stored)
+def store_in_chromadb(schema_descriptions):
+    """Store table descriptions in respective schema collections"""
+    for schema, tables in schema_descriptions.items():
+        collection = schema_collections[schema]
+        
+        for table, details in tables.items():
+            table_id = f"{schema}_{table}"
+            table_description = sanitize_metadata(details.get('description', 'No description available'))
+            
+            # Convert column information to a string representation
+            columns_str = json.dumps([
+                f"{col}: {sanitize_metadata(data['data_type'])}"
+                for col, data in details['columns'].items()
+            ])
+            
+            # Create metadata with string values
+            metadata_dict = {
+                'schema': schema,
+                'table': table,
+                # 'columns_json': columns_str  # Store columns as a JSON string
+                'columns': columns_str  # Store columns as a JSON string
+
+            }
+            
+            # Store in ChromaDB
+            collection.upsert(
+                ids=[table_id],
+                documents=[f"{table_description}\nColumns: {columns_str}"],
+                embeddings=[generate_embeddings(table_description)],
+                metadatas=[metadata_dict]
+            )
+            print(f"Stored embeddings for {table_id} in {schema} collection")
+
+def select_schema_collection(user_query):
+    """Select the appropriate schema collection based on user query"""
+    # Simple logic to detect schema name in the query
+    # Can be made more sophisticated if needed
+    for schema in schema_collections:
+        if schema.lower() in user_query.lower():
+            return schema, schema_collections[schema]
+    return None, None
+
+relevant_tables = []
+
+def query_tables(user_query):
+    """Query relevant tables based on user input"""
+    schema_name, collection = select_schema_collection(user_query)
+    
+    if not collection:
+        return {"error": "No matching schema found in the query"}
+    
+    # Search in the selected schema collection
+    results = collection.query(
+        query_texts=[user_query],
+        n_results=5  # Adjust based on needs
+    )
+    # print("############################################# query result ########################################################")
+    # print("results: ", results)
+    # print("############################################# query result ########################################################")
+
+    if 'metadatas' in results and results['metadatas'] and results['metadatas'][0]:
+        for metadata in results['metadatas'][0]:
+            if 'table' in metadata and 'schema' in metadata:
+                # schema = metadata['schema']
+                relevant_tables.append(metadata['table'])
+
+    # Process and return results
+    table_info = []
+    for i, doc in enumerate(results['documents'][0]):
+        metadata = results['metadatas'][0][i]
+        table_info.append({
+            'table_name': metadata['table'],
+            'description': doc,
+            'columns': metadata['columns']
+        })
+    
+    return {
+        'schema': schema_name,
+        'matching_tables': table_info
+    }
+
+# Function to fetch metadata from PostgreSQL
+def get_postgresql_metadata(db_config):
+    conn = psycopg2.connect(**db_config)
+    cur = conn.cursor()
+    query = """
+    SELECT 
+        s.schema_name,
+        t.table_name,
+        pgd.description AS table_description,
+        c.column_name,
+        c.data_type
+    FROM 
+        information_schema.columns c
+    JOIN 
+        information_schema.tables t ON c.table_name = t.table_name AND c.table_schema = t.table_schema
+    JOIN 
+        information_schema.schemata s ON t.table_schema = s.schema_name
+    LEFT JOIN 
+        pg_description pgd ON pgd.objoid = (
+            SELECT oid 
+            FROM pg_class 
+            WHERE relname = t.table_name 
+            AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = s.schema_name)
+        ) AND pgd.objsubid = 0
+    WHERE 
+    s.schema_name IN ('exotel','rockman')
+    AND t.table_type = 'BASE TABLE'
+    ORDER BY 
+        s.schema_name, t.table_name, c.ordinal_position;
+    """
+    cur.execute(query)
+    rows = cur.fetchall()
+    metadata = {}
+    for schema, table, table_description, column, data_type in rows:
+        if schema not in metadata:
+            metadata[schema] = {}
+        if table not in metadata[schema]:
+            metadata[schema][table] = {
+                'description': table_description,
+                'columns': {}
+            }
+        metadata[schema][table]['columns'][column] = {'data_type': data_type}
+    cur.close()
+    conn.close()
+
+    return metadata
+
+def clean_sql_query(query):
+    if query:
+        # Remove markdown code block syntax and extra backticks
+        clean_query = re.sub(r'^`*\s*sql\s*`*|^`*|`*$', '', query)
+        clean_query = re.sub(r'^```sql\n|^```|\n```$', '', clean_query)
+        return clean_query.strip()
+    return query
+
+def update_sql_tool(agent):
+    for tool in agent.tools:
+        if tool.name == "sql_db_query":
+            original_run = tool._run  # Change from tool.run to tool._run
+            def cleaned_run(*args, **kwargs):
+                if args:
+                    args = list(args)
+                    args[0] = clean_sql_query(args[0])
+                if 'query' in kwargs:
+                    kwargs['query'] = clean_sql_query(kwargs['query'])
+                return original_run(*args, **kwargs)
+            tool._run = cleaned_run  # Change from tool.run to tool._run
+            break
+
+db_config = {
+        'host': 'localhost',
+        'user': 'postgres',
+        'password': '1234',
+        'dbname': 'sita_test',
+        'port': 5432
+    }
+descriptions = get_postgresql_metadata(db_config)
+create_schema_collections(descriptions.keys())
+store_in_chromadb(descriptions)
+def create_agent(question):
+
+    print("Question:", question)
+
+    relevant_schema_info = query_tables(question)
+
+    engine = create_engine(f"postgresql+psycopg2://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['dbname']}?options=-csearch_path=exotel,rockman")
+
+    db = SQLDatabase(engine)
+
+    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+        
+    relevant_schema_text = "\n".join(relevant_tables)
+
+    # print("############################################# relevant_schema_text ########################################################")
+    # print("relevant chema text: ", relevant_schema_text)
+  
+    if 'schema' in relevant_schema_info:
+        schema = relevant_schema_info['schema']
+
+        # print("############################################# final Schema ########################################################")
+        # print("schema: ", schema)
+
+    custom_prefix = """You are an AI assistant specialized in generating SQL queries for a {dialect} database. Your task is to help users by converting their natural language questions into accurate postgres SQL queries and executing them to provide answers. You should always return the top {top_k} results.
+
+    Important notes:
+
+    1. If a user specifies a schema name, focus on tables within that schema.
+    2. Always use the schema name when referring to tables (e.g., exotel.users_user instead of just users_user).
+    3. Before generating a query, use the RelevantTables tool to identify the most appropriate tables for the question.
+    4. If user ask to generate output in tabular form, create a table of the response with respect to the column names with each item in a new line.
+    5. If user ask question related to "alerts" or "alert", look into the {schema}.sita_sita_fact table and generate a correct query.
+    6. If user ask question related to "assets" or "asset", look into the {schema}.sita_factassets table and generate a correct query.
+    7. If user ask question for top results with high risk, prepare a list in Descending order.
+    8. If user ask question for top results with low risk, prepare a list in Ascending order.
+    9. If user ask question related to "rosi" or "risk of security investement", look into the {schema}.vmf_asset_metrics table and generate a correct query.
+    10. only use the following tables: {table_info}
+    11. You are tasked with calculating the "Mean Time to Detection" (MTTD) for a given set of records.
+
+        Mean Time to Detection (MTTD) is the average of difference between the 'created_time' and 'starttime' for each record.
+        Instructions:
+
+        For each record, calculate the MTTD using the formula:
+        MTTD = AVERAGE(created_time - starttime)
+        Compute the MTTD by averaging all TTD values for the specified period.
+        Make sure to return the overall MTTD.
+
+        calculation for mean time to resolve:
+        'mttr' or 'mean time to resolve' = average of ('resolved_time' - 'created_time') with respect to the provided timeframe.
+
+        calculation for time to notify:
+        'ttn' or 'time to notify' = ('resolved_time' - 'created_time') when status_name = Customer Response Needed
+        'mttn' or 'mean time to notify' = average of 'time to notify or 'ttn' with respect to the provided timeframe.
+
+        Note: If starttime, created_time, resolved_time are NULL ignore those records.
+
+    12. If user asks question related to Alert Resolution Rate (ARR) or Incident Resolution Rate (IRR) use only {schema}.sita_sita_fact table.
+        Alert resolution rate is calculate using the status_name column. use SQL LIKE operator for getting Closed. for example "LIKE %Closed%"
+        Alert resolution rate (ARR) = (Status as closed alerts/ Total alerts) *100.
+
+    13. If user askes question related to False Positive or Falso Positive use only {schema}.sita_sita_fact table.
+        False Positive is calculated using type_name column.
+        False Positive  = (Alerts as False Positve/total alerts)*100
+
+    Here are some examples:
+
+        Example 1:
+        Question: Show me the assets by alert status as open for {schema}.
+        SQL Query:SELECT asset_name FROM {schema}.sita_sita_fact
+                    where alert_status='OPEN'
+        SQLResult: laptop, computer, RAM, CCTV
+        Answer:there are following assets with alter status as open, Laptop, Computer, RAM, CCTV.
+
+        Example 2:
+        Question: how many assets are from Noida geolocation?
+        SQL Query: SELECT COUNT(fa.asset_name) AS asset_count
+                    FROM {schema}.sita_factassets fa
+                    JOIN {schema}.sita_geolocation geo ON fa.asset_location_id = geo.id
+                    WHERE geo.city = 'Noida';
+        SQLResult: 2729
+        Answer: There are 2729 assets are from location Noida.
+
+        Example 3:
+        Question: is process name 'Developement ' associated with moe than one function?
+        SQL Query:SELECT sp.process_name, COUNT(DISTINCT sp.function_id) AS function_count
+                FROM {schema}.sita_process sp
+                JOIN {schema}.sita_function sf ON sp.function_id = sf.id
+                GROUP BY sp.process_name
+                HAVING COUNT(DISTINCT sp.function_id) > 1;
+        SQLResult: 0
+        Answer: The process Developement is not associted with other functions.
+
+        Example 4:
+        Question: how many assets are associated with the process 'data Base'?
+        SQL Query: SELECT count(sf.asset_name)
+                FROM {schema}.sita_factassets sf
+                JOIN {schema}.sita_process sp ON sp.process_id = any(sf.process)
+                where sp.process_name = 'Data Base'
+        SQLResult: 3  
+        Answer: There are 3 assets associated with process 'Data base'.These assets have the highest residual risk scores in the {schema} schema.
+
+        Example 5:
+        Question: which asset from hadapsar location has highest residual risk for {schema}.
+        SQL Query: SELECT fa.asset_name, fa.residual_risk
+                    FROM {schema}.sita_factassets fa
+                    JOIN {schema}.sita_geolocation geo ON fa.asset_location_id = geo.id
+                    WHERE geo.city LIKE '%Hadapsar%'
+                    ORDER BY fa.residual_risk DESC limit 5;
+                
+        SQLResult:  "RL-Co5"	"9.7"
+                    "CLOUD"	"9.46"
+                    "ed4"	"8.09"
+                    "ed3"	"7.5"
+                    "Endpoint testing"	"7.18"
+        Answer: There are following assets from Hadapsar location with highest residual risk, 
+                   | asset_name | residual risk |
+                   | "RL-Co5" |	"9.7" |
+                   | "CLOUD" |	"9.46" |
+                   | "ed4" |	"8.09" |
+                   | "ed3" |	"7.5" |
+                   | "Endpoint testing" |	"7.18" |
+
+    Now, let's proceed with your question.
+
+    """
+    system_message = custom_prefix.format(dialect = "PostgreSQL", top_k=2, table_info = relevant_schema_text, schema= schema )
+
+    # Define agent executor kwargs
+    agent_executor_kwargs = {
+        "handle_parsing_errors": True,
+        "return_intermediate_steps": False
+    }
+
+    # Create the agent with the tools
+    agent = create_sql_agent(llm,toolkit, prefix=system_message,agent_type= 'openai-tools',agent_executor_kwargs=agent_executor_kwargs,verbose=True)
+
+    update_sql_tool(agent)  # Add this line to update the SQL tool
+
+    return agent
+
+class SQLQueryCallback(ConsoleCallbackHandler):
+    def __init__(self):
+        super().__init__()
+        self.queries = []
+        self.current_query = None
+        self.results = []
+        self.run_map = {} # add this to resolve run_map errors
+        self._schema_format = None # add this to resolve schema_format errors
+
+    def on_chain_start(self, serialized, inputs, **kwargs):
+        # Implement a basic method to prevent schema_format errors
+        pass
+
+    def on_chain_end(self, outputs, **kwargs):
+        # Implement a basic method to prevent run_map errors
+        pass
+
+    def on_chat_model_start(self, *args, **kwargs):
+        # Implement a basic method to prevent schema_format errors
+        pass
+
+    def on_llm_new_token(self, token, **kwargs):
+        # Implement a basic method to prevent run_map errors
+        pass
+
+    def on_llm_end(self, *args, **kwargs):
+        # Implement a basic method to prevent run_map errors
+        pass
+        
+    def on_tool_start(self, serialized: Dict[str, Any], input_str: str, **kwargs) -> None:
+        if serialized["name"] == "sql_db_query":
+            try:
+                query_dict = json.loads(input_str)
+                self.current_query = query_dict["query"]
+            except:
+                self.current_query = input_str
+
+    def on_tool_end(self, output: str, **kwargs) -> None:
+        if self.current_query:
+            self.queries.append({
+                "query": self.current_query,
+                "result": output
+            })
+            self.current_query = None
+
+    def on_tool_error(self, error: str, **kwargs) -> None:
+        if self.current_query:
+            self.queries.append({
+                "query": self.current_query,
+                "error": error
+            })
+            self.current_query = None
+
+def extract_columns_from_query(sql_query):
+    """
+    Extract column names from a SQL SELECT query with improved robustness.
+    
+    Args:
+        sql_query (str): The SQL query to extract columns from
+    
+    Returns:
+        List[str]: List of extracted column names
+    """
+    # Normalize the query to make parsing easier
+    cleaned_query = sql_query.replace("'", "").replace("{", "").replace("}", "").replace("query: ", "").strip()
+    print("Cleaned query:", cleaned_query)
+
+    # Try to find the SELECT clause more flexibly
+    select_clause_match = re.search(r"SELECT\s+(.*?)\s+FROM", cleaned_query, re.IGNORECASE | re.DOTALL)
+    
+    if not select_clause_match:
+        # Alternative approach if standard match fails
+        select_clause_match = re.search(r"SELECT\s+(.*?)(?:\s+FROM|\s*$)", cleaned_query, re.IGNORECASE | re.DOTALL)
+    
+    if not select_clause_match:
+        print("No SELECT clause found")
+        return []
+
+    select_clause = select_clause_match.group(1).strip()
+    print("Select clause:", select_clause)
+
+    # Split columns carefully, handling aggregate and aliased columns
+    columns = []
+    current_column = []
+    paren_depth = 0
+    
+    for char in (select_clause + ','):
+        if char == '(':
+            paren_depth += 1
+        elif char == ')':
+            paren_depth -= 1
+        
+        if char == ',' and paren_depth == 0:
+            columns.append(''.join(current_column).strip())
+            current_column = []
+        else:
+            current_column.append(char)
+    
+    # Extract column names
+    extracted_columns = []
+    for column in columns:
+        # Check for AS alias first
+        alias_match = re.search(r'\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)\b', column, re.IGNORECASE)
+        if alias_match:
+            extracted_columns.append(alias_match.group(1))
+            continue
+        
+        # Try to extract column name
+        column_match = re.search(r'(?:^|\W)([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', column)
+        if column_match:
+            extracted_columns.append(column_match.group(1))
+    
+    print("Extracted columns:", extracted_columns)
+    return extracted_columns
+
+def convert_sql_result_to_json(query: str, result: str) -> List[Dict[str, Any]]:
+    """
+    Convert SQL query result tuples to JSON format with column names.
+    
+    Args:
+        query (str): The SQL query that was executed
+        result (str): The string representation of the query result in tuple format
+        
+    Returns:
+        List[Dict[str, Any]]: List of dictionaries where each dictionary represents a row
+    """
+    # Extract column names from the query
+    columns = extract_columns_from_query(query)
+
+    # If no columns found, use generic column names
+    if not columns or len(columns) == 0:
+        # Count the number of values in first tuple to determine number of columns
+        first_tuple = result.split('),')[0] if '),' in result else result
+        value_count = first_tuple.count(',') + 1
+        columns = [f"column_{i}" for i in range(value_count)]
+    
+    # Convert string result to list of tuples
+    # Remove the outer brackets
+    clean_result = result.strip('[]')
+    # Split into individual tuples
+    tuple_strings = re.findall(r'\(([^)]+)\)', clean_result)
+    
+    json_results = []
+    for tuple_str in tuple_strings:
+        # Split the tuple string into values and clean them
+        values = [val.strip().strip("'") for val in tuple_str.split(',')]
+        
+        # Create a dictionary for this row
+        row_dict = {}
+        for i, value in enumerate(values):
+            if i < len(columns):
+                # Try to convert to appropriate type
+                try:
+                    if value.lower() == 'null':
+                        parsed_value = None
+                    elif value.replace('.', '').isdigit():  # Handle decimal numbers
+                        parsed_value = float(value) if '.' in value else int(value)
+                    else:
+                        parsed_value = value
+                except ValueError:
+                    parsed_value = value
+                
+                row_dict[columns[i]] = parsed_value
+        
+        json_results.append(row_dict)
+    
+    return json_results
+
+def agent_process_query(agent, question):
+    # Create callback handler
+    callback = SQLQueryCallback()
+    
+    # Execute agent with callback
+    response = agent.invoke(
+        {"input": question},
+        {"callbacks": [callback]}
+    )
+    
+    # Get the last successful query
+    successful_queries = [q for q in callback.queries if "error" not in q]
+    last_successful_query = successful_queries[-1] if successful_queries else None
+    # print("last_successful_query['result']: ", last_successful_query['result'])
+    
+    # Generate column and values dictionary using LLM
+    prompt = f"""Extract and return the column names from 
+                User Query: {question}
+                SQL Query: {last_successful_query['query']}
+                and corresponding values from
+                SQL Result: {last_successful_query['result']}.
+                
+    
+                Requirements:
+                If any column contains datetime value, so don't trim it pass that as it is in th same format.
+                Figure out which chart to be prepared and Return only one best appropriate chart type and its details as per the below format.
+                provide the appropriate data using the chart template provided below and dont change and replaces the values.
+                Ensure all values of any column selected for a chart are included. Do not skip or filter duplicate values; instead, group them with other appropriate columns if necessary.
+                Provide data for all charts as per below template.
+                If required and column name is: id, consider it in xAxis, and select other appropriate column for legend.
+                Your response must strictly adhere to this format: 
+                        charts:[
+                                {{
+                                    "type": "pie",
+                                    "title": "Title of Chart",
+                                    "subTitle": "Sub Title of Chart",
+                                    "data": [
+                                        {{ "value": value1, "name": "name1" }},
+                                        {{ "value": value2, "name": "name2" }},
+                                        {{ "value": value3, "name": "name3" }},
+                                        {{ "value": value4, "name": "name4" }},
+                                        {{ "value": value4, "name": "name5" }}
+                                    ]
+                                }}
+                                ]
+                        charts:[
+                                {{
+                                    "type": "bar",
+                                    "title": "Title of Chart",
+                                    "subTitle": "Sub Title of Chart",
+                                    "xAxisTitle" : "Title of X-axis",
+                                    "yAxisTitle": "title of y-axis",
+                                    "data": {{
+                                        "xAxis": ["data1", "data2", "data3"],
+                                        "yAxis": ["data1", "data2", "data3"],
+                                        "legend": ["data1", "data2", "data3]
+                                    }}
+                                }}
+                        charts:[
+                                {{
+                                    "type": "line",
+                                    "title": "Title of Chart",
+                                    "subTitle": "Sub Title of Chart",
+                                    "xAxisTitle" : "Title of X-axis",
+                                    "yAxisTitle": "title of y-axis",
+                                    "data": {{
+                                        "xAxis": ["data1", "data2", "data3"],
+                                        "yAxis": ["data1", "data2", "data3"],
+                                        "legend": ["data1", "data2", "data3]
+                                    }}
+                                }}
+                                ]
+                        charts:[
+                                {{
+                                "type" : "line_histogram",
+                                "title" : "Title of chart",
+                                "xAxisTitle" : "Title of X-axis",
+                                "yAxisTitle": "title of y-axis",
+                                "histogramTitle" : "Histogram Title",
+                                "lineTitle" : "Line Title",
+                                "data" : {{
+                                    "xAxis" : "[data1, data2, data3]",
+                                    "yAxisLine" : "[data1, data2, data3]",
+                                    "yAxisHistogram" : "[data1, data2, data3]"
+                                }}
+                                }}
+                        ]
+                Pie Chart: A circular chart divided into slices to illustrate proportions or percentages, where each slice represents a part of the whole. 
+                It is ideal for showing the relative distribution of categories.
+                Bar Chart: A graphical representation using rectangular bars to display and compare discrete categories of data, with the length of each 
+                bar proportional to its value. It can be used for both horizontal and vertical comparisons.
+                Line Chart: A chart that connects data points with a continuous line, often used to track trends or changes over time. It is suitable for 
+                visualizing data in chronological order or other sequential contexts.
+                line_histogram: is a data visualization that overlays a line chart on top of a histogram, allowing you to simultaneously view the overall distribution of data 
+                (shown by the histogram's bars) and the trend or pattern within that distribution (represented by the line) on the same graph, providing a richer understanding 
+                of the data's characteristics and changes over time. The categories of both line and histogram chart should be different but they should combinely form a meaningfull chart.
+                For Example:
+                if last_successful_query['result'] : [(2464, 'Closed by client', datetime.timedelta(days=7, seconds=17369)), (2475, 'Closed by client', datetime.timedelta(days=5, seconds=44621)), 
+                                                    (2269, 'Closed by client', datetime.timedelta(days=5, seconds=5736)), (2586, 'Closed by client', datetime.timedelta(days=4, seconds=59298)), 
+                                                    (2289, 'Closed by Etek', datetime.timedelta(days=4, seconds=38921))]
+                Converted Last successful query:  [(2464, 'Closed by client', 172.82472222222222), (2475, 'Closed by client', 132.3947222222222), (2269, 'Closed by client', 121.59333333333333), 
+                                                    (2586, 'Closed by client', 112.47166666666666), (2289, 'Closed by Etek', 106.81138888888889)]
+                chart_response:  {{'columns': {{'id': [2464, 2475, 2269, 2586, 2289], 'status_name': ['Closed by client', 'Closed by client', 'Closed by client', 'Closed by client', 'Closed by Etek'], 
+                                'mttr': ['7 days 03:01:09', '5 days 12:31:01', '5 days 01:35:36', '4 days 18:18:18', '4 days 10:54:41']}}, 
+                                'charts': [{{'type': 'bar', 'data': {{'xAxis': [2464, 2475, 2269, 2586, 2289], 'yAxis': [172.82472222222222, 132.3947222222222, 121.59333333333333, 112.47166666666666, 106.81138888888889], "legend": ['Closed by client', 'Closed by client', 'Closed by client', 'Closed by client', 'Closed by Etek']}}}}]}}
+                If any chart is using date format in x-axis only show in the dd/mm/yy format.
+                If any result is having day/time/duration. Show that as it is in the table markdown and convert it into day/time/duration as a numerical value for chart generation.
+                Strictly If last_successful_query['result'] is empty than don't provide data for any chart and don't plot any graph.
+                IMPORTANT: Ensure the output is valid and parseable JSON. Include all values, handle duplicates appropriately, don' provide any placeholder or comment in the chart format, 
+                and strictly follow the chart template provided."""
+    chart_response_data = llm.invoke(prompt)
+    chart_response_str = chart_response_data.content.strip()
+    # Remove code block markers if present
+    chart_response_str = chart_response_str.strip('```json\n').strip('```')
+    # chart_response_str = chart_response_str.strip('```python\n').strip('```')
+    print("chart_response_str: ", chart_response_str)
+
+    chart_response = json.loads(chart_response_str)
+    print("chart_response: ", chart_response)
+
+    if last_successful_query:
+        # Convert the result to JSON format
+        json_result = convert_sql_result_to_json(
+            last_successful_query["query"],
+            last_successful_query["result"]
+        )
+        print(last_successful_query["result"])
+
+        #parse the chart_response into the desired structure
+        response_structure = []
+
+        # Add the Natural Language response as markdown
+        response_structure.append({
+            "type": "markdown",
+            "content": response["output"]
+        })
+
+            # Example logic to create a line chart
+        response_structure.append(chart_response)
+    
+        # Serialize the entire answer to a json string
+
+        serialized_answer = json.dumps(response_structure)
+
+        return serialized_answer
+
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\claude_solution\app\services\query_service.py
+
+#query_service.py
+from typing import Dict, Optional
+from ..utils.logger import setup_logger
+from .redis_service import RedisService
+from .query_processor import create_agent, agent_process_query
+from .session_service import SessionService
+logger = setup_logger(__name__)
+from fastapi import HTTPException
+import time
+
+class QueryService:
+    def __init__(self, redis_service: RedisService, session_service: SessionService):
+        self.redis_service = redis_service
+        self.session_service = session_service
+
+    async def process_query(
+        self,
+        query_text: str,
+        similarity_threshold: float,
+        session_id: Optional[str] = None
+    ) -> Dict:
+        try:
+
+            # Generate new session ID if none provided
+            if not session_id:
+                session_id = self.session_service.generate_session_id()
+                logger.info(f"Generated new session ID: {session_id}")
+
+            # Check if session exists (for provided session_id)
+            if session_id != self.session_service.generate_session_id():
+                if not self.redis_service.session_exists(session_id):
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Session {session_id} not found"
+                    )
+
+            # Check cache for similar queries
+            cached_result = self.redis_service.search_similar_query(
+                session_id,
+                query_text,
+                similarity_threshold
+            )
+            
+            if cached_result:
+                logger.info(f"Found cached response for query in session {session_id}")
+                return {
+                    "session_id": session_id,
+                    "query": query_text,
+                    "response": cached_result[1],
+                    "cached": True
+                }
+            
+            # Process new query using LangChain
+            t1= time.time()
+            inspect_chain = create_agent(query_text)  # Implement this method
+            answer = agent_process_query(inspect_chain, query_text)  # Implement this method
+            t2 = time.time()
+            print("Final execution time: ", t2-t1)
+            print("------- Complete final answer: ", answer)
+            
+            # Store in Redis
+            self.redis_service.store_qa_pair(session_id, query_text, answer)
+            
+            return {
+                "session_id": session_id,
+                "query": query_text,
+                "response": answer,
+                "cached": False
+            }
+        except Exception as e:
+            logger.error(f"Error processing query: {str(e)}")
+            raise
+
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\claude_solution\app\services\redis_service.py
+
+#redis_service.py
+import redis
+from typing import Optional, Tuple, List
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from ..config import settings
+from ..utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
+class RedisService:
+    def __init__(self):
+        self.client = redis.Redis(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            db=settings.REDIS_DB
+        )
+        self.model = SentenceTransformer(settings.MODEL_NAME)
+
+    def session_exists(self, session_id: str) -> bool:
+        """Check if a session exists in Redis"""
+        try:
+            return bool(self.client.exists(session_id))
+        except redis.RedisError as e:
+            logger.error(f"Redis error checking session: {str(e)}")
+            raise
+
+    def store_qa_pair(self, session_name: str, question: str, answer: str):
+        try:
+            self.client.hset(session_name, question, answer)
+            logger.info(f"Stored Q&A pair in session {session_name}")
+        except redis.RedisError as e:
+            logger.error(f"Redis storage error: {str(e)}")
+            raise
+
+    def search_similar_query(
+        self, 
+        session_name: str, 
+        new_query: str, 
+        similarity_threshold: float
+    ) -> Optional[Tuple[str, str]]:
+        try:
+            new_query_emb = self.model.encode([new_query])[0]
+            best_match = None
+            best_score = similarity_threshold
+            
+            for question in self.client.hkeys(session_name):
+                question_decoded = question.decode('utf-8')
+                question_emb = self.model.encode([question_decoded])[0]
+                score = self._calculate_similarity(new_query_emb, question_emb)
+                
+                if score > best_score:
+                    answer = self.client.hget(session_name, question).decode('utf-8')
+                    best_match = (question_decoded, answer)
+                    best_score = score
+            
+            return best_match
+        except Exception as e:
+            logger.error(f"Error in semantic search: {str(e)}")
+            raise
+
+    def _calculate_similarity(self, emb1: np.ndarray, emb2: np.ndarray) -> float:
+        return emb1.dot(emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
+
+    def get_session_history(self, session_id: str) -> List[dict]:
+        try:
+            chat_history = self.client.hgetall(session_id)
+            messages = []
+            
+            for q, a in chat_history.items():
+                messages.extend([
+                    {"role": "user", "content": q.decode('utf-8')},
+                    {"role": "assistant", "content": a.decode('utf-8')}
+                ])
+            
+            return messages
+        except redis.RedisError as e:
+            logger.error(f"Redis error getting history: {str(e)}")
+            raise
+
+    def get_all_sessions(self) -> List[dict]:
+        try:
+            sessions = []
+            for key in self.client.keys('*'):
+                session_id = key.decode('utf-8')
+                sessions.append({
+                    "session_id": session_id,
+                })
+            return sessions
+        except redis.RedisError as e:
+            logger.error(f"Redis error getting sessions: {str(e)}")
+            raise
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\claude_solution\app\services\session_service.py
+
+from uuid import uuid4
+from datetime import datetime
+from ..utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
+class SessionService:
+    @staticmethod
+    def generate_session_id() -> str:
+        """Generate a unique session ID with timestamp"""
+        now_time = datetime.now()
+        formatted_time = now_time.strftime("%d/%m/%Y, %H:%M:%S")
+        return f"{formatted_time}"
+
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\claude_solution\app\services\__init__.py
+
+
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\claude_solution\app\utils\logger.py
+
+#logger.py
+import logging
+
+def setup_logger(name: str) -> logging.Logger:
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    return logger
+
+#
+
+ Path: C:\Shreyansh\Samta\fastAPI_AI_reporting\claude_solution\app\utils\__init__.py
+
